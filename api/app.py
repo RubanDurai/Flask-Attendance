@@ -205,7 +205,40 @@ def index():
       {% endif %}
     </div>
 
-    <!-- Modal + Scripts identical -->
+    <!-- ✅ Attendance Modal -->
+    <div class="modal fade" id="attModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow-lg">
+          <div class="modal-header bg-light">
+            <h5 class="modal-title">Mark Attendance - <span id="modalDate"></span></h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <div class="d-flex flex-wrap gap-2 mb-3">
+              <button class="btn btn-outline-primary btn-shift" data-shift="FS">FS</button>
+              <button class="btn btn-outline-primary btn-shift" data-shift="SS">SS</button>
+              <button class="btn btn-outline-primary btn-shift" data-shift="NS">NS</button>
+              <button class="btn btn-outline-primary btn-shift" data-shift="GEN">GEN</button>
+            </div>
+
+            <div class="d-flex flex-wrap gap-2 mb-3">
+              <button id="markPresent" class="btn btn-outline-success">Present</button>
+              <button id="markAbsent" class="btn btn-outline-danger">Absent</button>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">OT Hours</label>
+              <input type="number" id="otHours" min="0" step="0.5" class="form-control" value="0">
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" id="clearBtn" class="btn btn-outline-secondary">Clear</button>
+            <button type="button" id="saveBtn" class="btn btn-primary">Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
     document.addEventListener('DOMContentLoaded',()=>{
@@ -224,6 +257,7 @@ def index():
     </script>
     </body></html>
     """
+
 
     return render_template_string(
         html,
