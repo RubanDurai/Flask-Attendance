@@ -1,173 +1,65 @@
-# app.py - Single-file Flask app with MongoDB, bcrypt, server-side sessions, per-user attendance
-import os
-import secrets
-import json
+from flask import Flask, render_template_string, request, redirect, jsonify, make_response, url_for
 from datetime import date, datetime, timedelta
+import calendar, json, time
+from pathlib import Path
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt  # PyJWT
+from functools import wraps
 
-from flask import Flask, render_template_string, request, jsonify, redirect, make_response, g
-from pymongo import MongoClient, ASCENDING
-from bson.objectid import ObjectId
-import bcrypt
-
-# ---------- Config ----------
-MONGO_URI = os.getenv("MONGO_URI", ""mongodb+srv://tnbots:tnbots@cluster0.lkuiies.mongodb.net/?retryWrites=true&w=majority)
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI environment variable not set. Set it to your MongoDB connection string.")
-
-DB_NAME = os.getenv("MONGO_DBNAME", "attendance_app")
-SESSION_COOKIE_NAME = "session"   # HttpOnly cookie set on login
-SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
-
+# ---------------------------
+# CONFIG
+# ---------------------------
 app = Flask(__name__)
-app.config["JSON_SORT_KEYS"] = False
+app.config["SECRET_KEY"] = "change-me-to-a-secure-random-string"  # <<-- change for production
+JWT_ALGORITHM = "HS256"
+JWT_EXP_SECONDS = 24 * 3600  # 24 hours
+RESET_EXP_SECONDS = 15 * 60  # 15 minutes for password reset tokens
+DATA_FILE = Path("/tmp/attendance.json")
 
-# ---------- MongoDB client ----------
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+# ---------------------------
+# Storage (Vercel-safe) - initialize if missing
+# File structure:
+# { "alice": { "name": "...", "password": "<hash>", "is_admin": false,
+#              "attendance": {...}, "reset_token": {"token": "...", "exp": 123456} } }
+# ---------------------------
+if not DATA_FILE.exists():
+    DATA_FILE.write_text(json.dumps({}, indent=2))
 
-# ensure indexes
-db.users.create_index([("username", ASCENDING)], unique=True)
-db.sessions.create_index([("token", ASCENDING)], unique=True)
-db.attendance.create_index([("user_id", ASCENDING), ("day_iso", ASCENDING)], unique=True)
-
-# ---------- Helpers: users / sessions / attendance ----------
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-def check_password(password: str, hashed: str) -> bool:
+def read_data():
     try:
-        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+        return json.loads(DATA_FILE.read_text())
     except Exception:
-        return False
+        return {}
 
-def create_user(username: str, name: str, password: str):
-    username = username.strip().lower()
-    name = name.strip()
-    if not username or not name or not password:
-        return False, "missing_fields"
-    if db.users.find_one({"username": username}):
-        return False, "username_taken"
-    ph = hash_password(password)
-    res = db.users.insert_one({"username": username, "name": name, "password_hash": ph, "created_at": datetime.utcnow()})
-    return True, str(res.inserted_id)
+def write_data(d):
+    DATA_FILE.write_text(json.dumps(d, indent=2))
 
-def authenticate_user(username: str, password: str):
-    if not username or not password:
-        return None
-    username = username.strip().lower()
-    user = db.users.find_one({"username": username})
-    if not user:
-        return None
-    if check_password(password, user.get("password_hash", "")):
-        # return a sanitized user dict
-        return {"_id": user["_id"], "username": user["username"], "name": user["name"]}
-    return None
-
-def create_session_for_user(user_id: ObjectId):
-    token = secrets.token_urlsafe(32)
-    db.sessions.insert_one({"token": token, "user_id": user_id, "created_at": datetime.utcnow()})
-    return token
-
-def get_user_by_session_token(token: str):
-    if not token:
-        return None
-    s = db.sessions.find_one({"token": token})
-    if not s:
-        return None
-    user = db.users.find_one({"_id": s["user_id"]})
-    if not user:
-        # orphaned session: remove it
-        db.sessions.delete_one({"_id": s["_id"]})
-        return None
-    return {"_id": user["_id"], "username": user["username"], "name": user["name"]}
-
-def delete_session(token: str):
-    if token:
-        db.sessions.delete_one({"token": token})
-
-# Attendance helpers (per-user)
-def upsert_attendance(user_id: ObjectId, day_iso: str, shift: str, status: str, ot_hours: float):
-    try:
-        db.attendance.update_one(
-            {"user_id": user_id, "day_iso": day_iso},
-            {"$set": {"shift": shift, "status": status, "ot_hours": float(ot_hours), "updated_at": datetime.utcnow()}},
-            upsert=True
-        )
-        return True
-    except Exception as e:
-        return False
-
-def get_attendance_for_user(user_id: ObjectId, start_iso: str, end_iso: str):
-    cursor = db.attendance.find({"user_id": user_id, "day_iso": {"$gte": start_iso, "$lte": end_iso}})
-    out = {}
-    for r in cursor:
-        out[r["day_iso"]] = {"shift": r.get("shift"), "status": r.get("status"), "ot_hours": r.get("ot_hours", 0)}
-    return out
-
-def get_attendance_record(user_id: ObjectId, day_iso: str):
-    r = db.attendance.find_one({"user_id": user_id, "day_iso": day_iso})
-    if not r:
-        return None
-    return {"shift": r.get("shift"), "status": r.get("status"), "ot_hours": r.get("ot_hours", 0)}
-
-def delete_attendance_record(user_id: ObjectId, day_iso: str):
-    db.attendance.delete_one({"user_id": user_id, "day_iso": day_iso})
-
-def summary_for_user_in_range(user_id: ObjectId, start_iso: str, end_iso: str):
-    cursor = db.attendance.find({"user_id": user_id, "day_iso": {"$gte": start_iso, "$lte": end_iso}})
-    present = absent = 0
-    ot_total = 0.0
-    shift_dates = {}
-    for r in cursor:
-        st = r.get("status")
-        if st == "Present":
-            present += 1
-            try:
-                ot_total += float(r.get("ot_hours") or 0)
-            except:
-                pass
-        elif st == "Absent":
-            absent += 1
-        sh = (r.get("shift") or "").strip()
-        if st == "Present" and sh and sh != "GEN":
-            try:
-                d = datetime.fromisoformat(r["day_iso"]).day
-                shift_dates.setdefault(sh, []).append(d)
-            except:
-                pass
-    return {"present": present, "absent": absent, "ot_hours": round(ot_total, 1), "shift_dates": shift_dates}
-
-def make_shift_line_html(shift_dates):
+# ---------------------------
+# Keep your helpers
+# ---------------------------
+def make_shift_line(shift_dates):
     ordered_shifts = ["FS", "SS", "NS", "GEN2"]
     shift_names = {"FS": "First Shift", "SS": "Second Shift", "NS": "Night Shift"}
     parts = []
     for s in ordered_shifts:
         if s in shift_dates and shift_dates[s]:
-            parts.append(f"{shift_names.get(s,s)}: {', '.join(str(x) for x in sorted(set(shift_dates[s])))}")
+            label = shift_names.get(s, s)
+            parts.append(f"{label}: {', '.join(str(x) for x in sorted(set(shift_dates[s])))}")
     for s in sorted(shift_dates.keys()):
         if s not in ordered_shifts and shift_dates[s]:
-            parts.append(f"{s}: {', '.join(str(x) for x in sorted(set(shift_dates[s])))}")
+            label = shift_names.get(s, s)
+            parts.append(f"{label}: {', '.join(str(x) for x in sorted(set(shift_dates[s])))}")
     return "<br>".join(parts)
 
-# ---------- Decorator-like helper to require session ----------
-def require_user_from_request():
-    token = request.cookies.get(SESSION_COOKIE_NAME)
-    if not token:
-        return None, (jsonify({"error": "not_authenticated"}), 401)
-    user = get_user_by_session_token(token)
-    if not user:
-        # clear cookie client-side by returning special response if used by browser
-        resp = jsonify({"error": "invalid_session"})
-        resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
-        return None, (resp, 401)
-    return user, None
-
-# ---------- INLINE HTML Templates ----------
-# - LOGIN_HTML: uses /api/register and /api/login
-# - MAIN_HTML: attendance UI (same structure you provided), with fetch requests using credentials: 'same-origin'
-LOGIN_HTML = """<!DOCTYPE html>
+# ---------------------------
+# Templates (slightly adjusted to use server-set name + token auth)
+# ---------------------------
+LOGIN_HTML = """
+<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Login / Register</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;font-family:Poppins,system-ui,Segoe UI,Roboto,Helvetica,Arial}
@@ -184,7 +76,7 @@ body{background:#f9f9f9;display:flex;align-items:center;justify-content:center;h
 .center{font-size:13px;margin-top:10px;text-align:center}
 .link{color:#ffb400;text-decoration:none;cursor:pointer}
 .small{font-size:12px;color:#666;margin-top:6px}
-.err{color:#c00;font-size:13px;margin-top:8px;text-align:center}
+.note{font-size:12px;color:#333;margin-top:8px}
 </style>
 </head>
 <body>
@@ -194,31 +86,40 @@ body{background:#f9f9f9;display:flex;align-items:center;justify-content:center;h
     <div id="tabRegister" class="tab">Register</div>
   </div>
 
+  <!-- LOGIN -->
   <form id="loginForm" autocomplete="off" onsubmit="return false;">
     <div class="input-group">
+      <svg class="input-icon" viewBox="0 0 24 24" fill="#ffb400"><path d="M12 12c2.7 0 8 1.34 8 4v4H4v-4c0-2.66 5.3-4 8-4zM12 10a4 4 0 110-8 4 4 0 010 8z"/></svg>
       <input id="loginUser" placeholder="Username" />
     </div>
     <div class="input-group">
+      <svg class="input-icon" viewBox="0 0 24 24" fill="#ffb400"><path d="M12 17a2 2 0 100-4 2 2 0 000 4zm6-6V8a6 6 0 10-12 0v3H4v10h16V11h-2z"/></svg>
       <input id="loginPass" type="password" placeholder="Password" />
     </div>
     <button class="btn" id="btnLogin" type="button">Login</button>
     <div class="center small">No account? <span class="link" id="toRegister">Register</span></div>
-    <div id="loginErr" class="err"></div>
+    <div class="center note"><a href="#" id="forgotLink">Forgot password?</a></div>
   </form>
 
+  <!-- REGISTER -->
   <form id="registerForm" style="display:none" autocomplete="off" onsubmit="return false;">
     <div class="input-group">
+      <svg class="input-icon" viewBox="0 0 24 24" fill="#ffb400"><path d="M12 12c2.7 0 8 1.34 8 4v4H4v-4c0-2.66 5.3-4 8-4zM12 10a4 4 0 110-8 4 4 0 010 8z"/></svg>
       <input id="regName" placeholder="Full Name" />
     </div>
     <div class="input-group">
+      <svg class="input-icon" viewBox="0 0 24 24" fill="#ffb400"><path d="M12 12c2.7 0 8 1.34 8 4v4H4v-4c0-2.66 5.3-4 8-4zM12 10a4 4 0 110-8 4 4 0 010 8z"/></svg>
       <input id="regUser" placeholder="Choose username" />
     </div>
     <div class="input-group">
+      <svg class="input-icon" viewBox="0 0 24 24" fill="#ffb400"><path d="M12 17a2 2 0 100-4 2 2 0 000 4zm6-6V8a6 6 0 10-12 0v3H4v10h16V11h-2z"/></svg>
       <input id="regPass" type="password" placeholder="Choose password" />
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+      <label style="font-size:13px"><input id="isAdmin" type="checkbox" /> Make admin</label>
     </div>
     <button class="btn" id="btnRegister" type="button">Sign Up</button>
     <div class="center small">Already registered? <span class="link" id="toLogin">Login</span></div>
-    <div id="regErr" class="err"></div>
   </form>
 </div>
 
@@ -233,72 +134,72 @@ const switchTab = (to) => {
 };
 
 document.addEventListener('DOMContentLoaded', () => {
-  // If session cookie exists, go to /
-  if (document.cookie.split('; ').find(row => row.startsWith('session='))) {
-    window.location.href = '/';
-    return;
-  }
+  $('tabLogin').addEventListener('click', () => switchTab('login'));
+  $('tabRegister').addEventListener('click', () => switchTab('register'));
+  $('toRegister').addEventListener('click', (e) => { e.preventDefault(); switchTab('register'); });
+  $('toLogin').addEventListener('click', (e) => { e.preventDefault(); switchTab('login'); });
 
-  $('tabLogin').onclick = () => switchTab('login');
-  $('tabRegister').onclick = () => switchTab('register');
-  $('toRegister').onclick = (e) => { e.preventDefault(); switchTab('register'); };
-  $('toLogin').onclick = (e) => { e.preventDefault(); switchTab('login'); };
-
-  $('btnRegister').onclick = async () => {
-    $('regErr').textContent = '';
+  $('btnRegister').addEventListener('click', async () => {
     const name = $('regName').value.trim();
-    const username = $('regUser').value.trim();
-    const password = $('regPass').value.trim();
-    if (!name || !username || !password) { $('regErr').textContent = 'Please fill all fields'; return; }
+    const user = $('regUser').value.trim();
+    const pass = $('regPass').value.trim();
+    const admin = $('isAdmin').checked;
+    if (!name || !user || !pass) { alert('Please fill all fields'); return; }
     try {
-      const res = await fetch('/api/register', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({name, username, password})
-      });
+      const res = await fetch('/api/register', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,user,pass,admin})});
       const j = await res.json();
-      if (!res.ok) {
-        $('regErr').textContent = j.error || 'Register failed';
-      } else {
-        alert('Account created. Please login.');
-        switchTab('login');
-      }
-    } catch (e) { $('regErr').textContent = 'Network error'; }
-  };
+      if (!res.ok) { alert(j.error || 'Register failed'); return; }
+      alert('Account created successfully! Please log in.');
+      $('regName').value='';$('regUser').value='';$('regPass').value='';$('isAdmin').checked=false;
+      switchTab('login');
+    } catch(e){ alert('Register failed: '+e.message); }
+  });
 
-  $('btnLogin').onclick = async () => {
-    $('loginErr').textContent = '';
-    const username = $('loginUser').value.trim();
-    const password = $('loginPass').value.trim();
-    if (!username || !password) { $('loginErr').textContent = 'Please enter username and password'; return; }
+  $('btnLogin').addEventListener('click', async () => {
+    const user = $('loginUser').value.trim();
+    const pass = $('loginPass').value.trim();
+    if (!user || !pass) { alert('Please enter credentials'); return; }
     try {
-      const res = await fetch('/api/login', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({username, password})
-      });
+      const res = await fetch('/api/login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user,pass})});
       const j = await res.json();
-      if (!res.ok) {
-        $('loginErr').textContent = j.error || 'Login failed';
-      } else {
-        window.location.href = '/';
-      }
-    } catch (e) { $('loginErr').textContent = 'Network error'; }
-  };
+      if (!res.ok) { alert(j.error || 'Login failed'); return; }
+      // server set HttpOnly token cookie; just redirect
+      window.location = '/';
+    } catch(e){ alert('Login failed: '+e.message); }
+  });
 
-  document.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const regVisible = window.getComputedStyle($('registerForm')).display !== 'none'; if (regVisible) $('btnRegister').click(); else $('btnLogin').click(); } });
+  $('forgotLink').addEventListener('click', async (e) => {
+    e.preventDefault();
+    const user = prompt('Enter your username for password reset:');
+    if (!user) return;
+    try {
+      const res = await fetch('/api/forgot', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user})});
+      const j = await res.json();
+      if (!res.ok) { alert(j.error || 'Failed'); return; }
+      // NOTE: in production you'd email this link. Here we show it so you can test.
+      alert('Password reset link (for testing):\\n' + j.reset_link);
+    } catch(e){ alert('Failed: '+e.message); }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const regVisible = window.getComputedStyle($('registerForm')).display !== 'none';
+      if (regVisible) $('btnRegister').click();
+      else $('btnLogin').click();
+    }
+  });
 });
 </script>
-</body></html>
+</body>
+</html>
 """
 
-# MAIN_HTML: (attendance UI). Uses Jinja variables injected from server.
-MAIN_HTML = """<!doctype html><html lang="en"><head>
+MAIN_HTML = """
+<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Self Attendance</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 <style>
 body{background:#fafbff;font-family:system-ui;margin:0;padding:0;}
 .container-wrap{max-width:980px;margin:24px auto;padding:12px;}
@@ -333,17 +234,20 @@ body{background:#fafbff;font-family:system-ui;margin:0;padding:0;}
 </style></head><body>
 <div class="container-wrap">
   <div class="header">
-    <div class="welcome">Hi, <span id="userName">{{ user_name }}</span></div>
+    <div class="welcome">Hi, <span id="userName">{{ current_name }}</span></div>
     <div class="actions">
-      <a class="btn btn-sm btn-outline-secondary" href="/api/logout">Logout</a>
+      {% if is_admin %}
+        <a class="btn btn-sm btn-outline-primary" href="/admin">Admin</a>
+      {% endif %}
+      <a class="btn btn-sm btn-outline-secondary" href="/logout">Logout</a>
     </div>
   </div>
 
   <div class="calendar-card">
     <div class="month-nav shadow-sm">
-      <a class="nav-btn" href="/?month={{ month-1 if month>1 else 12 }}&year={{ year if month>1 else year-1 }}"><i class="fa fa-arrow-left"></i></a>
+      <a class="nav-btn" href="/?month={{ month-1 if month>1 else 12 }}&year={{ year if month>1 else year-1 }}"><i class="fa-solid fa-arrow-left"></i></a>
       <div class="month-label">{{ calendar.month_name[month] }} {{ year }}</div>
-      <a class="nav-btn" href="/?month={{ month+1 if month<12 else 1 }}&year={{ year if month<12 else year+1 }}"><i class="fa fa-arrow-right"></i></a>
+      <a class="nav-btn" href="/?month={{ month+1 if month<12 else 1 }}&year={{ year if month<12 else year+1 }}"><i class="fa-solid fa-arrow-right"></i></a>
     </div>
   </div>
 
@@ -433,16 +337,7 @@ document.addEventListener('DOMContentLoaded', function(){
     el.addEventListener('click',async function(){
       currentDate=this.dataset.date;document.getElementById('modalDate').textContent=currentDate;
       setShiftActive('GEN');setStatusActive('Present');document.getElementById('otHours').value=0;
-      try{
-        const r=await fetch('/attendance/'+currentDate, { credentials: 'same-origin' });
-        if(r.ok){
-          const d=await r.json();
-          if(d){ setShiftActive(d.shift||'GEN'); setStatusActive(d.status||'Present'); document.getElementById('otHours').value=d.ot_hours||0; }
-        } else {
-          // not logged in or error - redirect to login
-          if(r.status === 401) window.location.href = '/login';
-        }
-      }catch(e){}
+      try{const r=await fetch('/attendance/'+currentDate);if(r.ok){const d=await r.json();if(d){setShiftActive(d.shift||'GEN');setStatusActive(d.status||'Present');document.getElementById('otHours').value=d.ot_hours||0;}}}catch(e){}
       bsModal.show();
     });
   });
@@ -452,15 +347,13 @@ document.addEventListener('DOMContentLoaded', function(){
   document.getElementById('markAbsent').onclick=()=>setStatusActive('Absent');
 
   async function updateSummary(){
-    const r=await fetch('/summary', { credentials: 'same-origin' });
+    const r=await fetch('/summary');
     if(r.ok){
       const s=await r.json();
       document.getElementById('presentCount').textContent=s.present;
       document.getElementById('absentCount').textContent=s.absent;
       document.getElementById('otHoursTotal').textContent=s.ot_hours.toFixed(1);
-      document.getElementById('shiftLine').innerHTML='⚙️ <b>Shifts →</b><br>'+ (s.shift_line_html || '');
-    } else if (r.status === 401) {
-      window.location.href = '/login';
+      shiftLine.innerHTML='⚙️ <b>Shifts →</b><br>'+s.shift_line;
     }
   }
 
@@ -469,7 +362,7 @@ document.addEventListener('DOMContentLoaded', function(){
     const otVal=selectedStatus==='Absent'?0:parseFloat(document.getElementById('otHours').value||0);
     const payload={date:currentDate,shift:selectedShift,status:selectedStatus,ot_hours:otVal};
     try{
-      const res=await fetch('/attendance', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+      const res=await fetch('/attendance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(res.ok){
         bsModal.hide();
         const cell=document.querySelector('.day-cell[data-date="'+currentDate+'"]');
@@ -480,10 +373,9 @@ document.addEventListener('DOMContentLoaded', function(){
           cell.querySelector('.ot-badge').textContent=otVal?('OT: '+otVal):'';
           cell.querySelector('.shift-label').textContent=selectedShift;}
         updateSummary();
-      } else if (res.status === 401) {
-        window.location.href = '/login';
       } else {
-        const j = await res.json(); alert(j.error || 'Save failed');
+        const j = await res.json().catch(()=>({error:'Save failed'}));
+        alert(j.error || 'Save failed');
       }
     }catch(e){alert('Save failed:'+e.message);}
   };
@@ -491,140 +383,274 @@ document.addEventListener('DOMContentLoaded', function(){
   document.getElementById('clearBtn').onclick=async()=>{
     if(!currentDate||!confirm('Clear attendance for '+currentDate+'?'))return;
     try{
-      const r=await fetch('/attendance/'+currentDate, { method:'DELETE', credentials:'same-origin' });
+      const r=await fetch('/attendance/'+currentDate,{method:'DELETE'});
       if(r.ok){
         bsModal.hide();
         const cell=document.querySelector('.day-cell[data-date="'+currentDate+'"]');
         if(cell){cell.classList.remove('present','absent');cell.querySelector('.status-pill').textContent='';cell.querySelector('.ot-badge').textContent='';cell.querySelector('.shift-label').textContent='GEN';}
         updateSummary();
-      } else if (r.status === 401) {
-        window.location.href = '/login';
       } else {
-        const j = await r.json(); alert(j.error || 'Clear failed');
+        const j = await r.json().catch(()=>({error:'Clear failed'}));
+        alert(j.error || 'Clear failed');
       }
     }catch(e){alert('Clear failed:'+e.message);}
   };
   setShiftActive('GEN');setStatusActive('Present');
 });
-</script></div></body></html>"""
+</script></div></body></html>
+"""
 
-# ---------- API endpoints ----------
+# ---------------------------
+# ADMIN HTML (simple)
+# ---------------------------
+ADMIN_HTML = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Dashboard</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body class="p-3">
+<div class="container">
+  <h3>Admin Dashboard</h3>
+  <p>Signed in as <b>{{ current_name }}</b> (<a href="/">Back to app</a>)</p>
+  <div id="usersWrap"></div>
+</div>
+<script>
+async function loadUsers(){
+  const r = await fetch('/api/admin/users');
+  if (!r.ok) { document.getElementById('usersWrap').innerText='Failed to load users'; return; }
+  const j = await r.json();
+  const wrap = document.getElementById('usersWrap');
+  wrap.innerHTML = '';
+  const tbl = document.createElement('table'); tbl.className='table';
+  const thead = document.createElement('thead'); thead.innerHTML='<tr><th>User</th><th>Name</th><th>Admin</th><th>Actions</th></tr>';
+  tbl.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const u of j.users){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${u.username}</td><td>${u.name||''}</td><td>${u.is_admin? 'Yes':'No'}</td>
+      <td>
+        <button class="btn btn-sm btn-primary" onclick="view('${u.username}')">View</button>
+        <button class="btn btn-sm btn-danger" onclick="del('${u.username}')">Delete</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+}
+
+async function view(username){
+  const r = await fetch('/api/admin/user/' + encodeURIComponent(username));
+  if (!r.ok){ alert('Failed'); return; }
+  const j = await r.json();
+  alert(JSON.stringify(j, null, 2));
+}
+
+async function del(username){
+  if (!confirm('Delete user '+username+' ?')) return;
+  const r = await fetch('/api/admin/user/' + encodeURIComponent(username), {method:'DELETE'});
+  if (r.ok) { alert('Deleted'); loadUsers(); }
+  else { const j = await r.json().catch(()=>({error:'failed'})); alert(j.error||'Failed'); }
+}
+
+loadUsers();
+</script>
+</body></html>
+"""
+
+# ---------------------------
+# Utilities: JWT helpers and auth decorator
+# ---------------------------
+def create_jwt(payload, exp_seconds=JWT_EXP_SECONDS):
+    payload = payload.copy()
+    payload["exp"] = int(time.time()) + int(exp_seconds)
+    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm=JWT_ALGORITHM)
+
+def decode_jwt(token):
+    try:
+        return jwt.decode(token, app.config["SECRET_KEY"], algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return None
+
+def get_token_from_request():
+    # Try cookie first, then Authorization header
+    token = request.cookies.get("token")
+    if token:
+        return token
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth.split(" ", 1)[1]
+    return None
+
+def require_auth(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        token = get_token_from_request()
+        if not token:
+            return jsonify({"error":"Authentication required"}), 401
+        payload = decode_jwt(token)
+        if not payload:
+            return jsonify({"error":"Invalid or expired token"}), 401
+        username = payload.get("sub")
+        data = read_data()
+        if username not in data:
+            return jsonify({"error":"Invalid session"}), 401
+        # attach user info to request context via kwargs
+        kwargs["_auth_user"] = username
+        kwargs["_auth_payload"] = payload
+        return f(*args, **kwargs)
+    return wrapped
+
+def require_admin(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        token = get_token_from_request()
+        if not token:
+            return jsonify({"error":"Authentication required"}), 401
+        payload = decode_jwt(token)
+        if not payload:
+            return jsonify({"error":"Invalid or expired token"}), 401
+        username = payload.get("sub")
+        data = read_data()
+        user = data.get(username)
+        if not user or not user.get("is_admin"):
+            return jsonify({"error":"Admin access required"}), 403
+        kwargs["_auth_user"] = username
+        kwargs["_auth_payload"] = payload
+        return f(*args, **kwargs)
+    return wrapped
+
+# ---------------------------
+# ROUTES: Login/Register pages and APIs
+# ---------------------------
+@app.route("/login")
+def login_page():
+    # if logged in, redirect to app
+    token = get_token_from_request()
+    if token and decode_jwt(token):
+        return redirect("/")
+    return render_template_string(LOGIN_HTML)
+
+@app.route("/logout")
+def logout():
+    resp = make_response(redirect("/login"))
+    resp.delete_cookie("token")
+    return resp
+
 @app.route("/api/register", methods=["POST"])
 def api_register():
     payload = request.get_json(force=True)
     name = (payload.get("name") or "").strip()
-    username = (payload.get("username") or "").strip()
-    password = payload.get("password") or ""
-    ok, info = create_user(username, name, password)
-    if not ok:
-        if info == "username_taken":
-            return jsonify({"error": "username_taken"}), 409
-        return jsonify({"error": "invalid_data"}), 400
-    return jsonify({"ok": True}), 201
+    user = (payload.get("user") or "").strip()
+    passwd = (payload.get("pass") or "").strip()
+    is_admin = bool(payload.get("admin"))
+    if not (name and user and passwd):
+        return jsonify({"error":"Missing fields"}), 400
+    data = read_data()
+    if user in data:
+        return jsonify({"error":"Username already exists"}), 409
+    # create user
+    data[user] = {
+        "name": name,
+        "password": generate_password_hash(passwd),
+        "is_admin": bool(is_admin),
+        "attendance": {}
+    }
+    write_data(data)
+    return jsonify({"ok": True})
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
     payload = request.get_json(force=True)
-    username = (payload.get("username") or "").strip()
-    password = payload.get("password") or ""
-    user = authenticate_user(username, password)
-    if not user:
-        return jsonify({"error": "invalid_credentials"}), 401
-    token = create_session_for_user(user["_id"])
-    resp = jsonify({"ok": True})
-    secure_flag = False
-    if os.getenv("FLASK_ENV") == "production" or os.getenv("ENV") == "prod":
-        secure_flag = True
-    resp.set_cookie(SESSION_COOKIE_NAME, token, max_age=SESSION_COOKIE_MAX_AGE, httponly=True, samesite="Lax", secure=secure_flag, path="/")
-    # also set a non-httponly display cookie for client UI
-    resp.set_cookie("displayName", user["name"], max_age=SESSION_COOKIE_MAX_AGE, httponly=False, samesite="Lax", secure=secure_flag, path="/")
+    user = (payload.get("user") or "").strip()
+    passwd = (payload.get("pass") or "").strip()
+    if not (user and passwd):
+        return jsonify({"error":"Missing credentials"}), 400
+    data = read_data()
+    user_obj = data.get(user)
+    if not user_obj:
+        return jsonify({"error":"Invalid username or password"}), 401
+    stored = user_obj.get("password")
+    if not stored or not check_password_hash(stored, passwd):
+        return jsonify({"error":"Invalid username or password"}), 401
+    # create JWT
+    token = create_jwt({"sub": user})
+    resp = make_response(jsonify({"ok": True, "name": user_obj.get("name","")}))
+    # set HttpOnly cookie
+    resp.set_cookie("token", token, httponly=True, samesite='Lax', max_age=JWT_EXP_SECONDS)
     return resp
 
-@app.route("/api/logout")
-def api_logout():
-    token = request.cookies.get(SESSION_COOKIE_NAME)
-    if token:
-        delete_session(token)
-    resp = make_response(redirect("/login"))
-    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
-    resp.delete_cookie("displayName", path="/")
-    return resp
-
-# Attendance CRUD (uses session)
-@app.route("/attendance/<day_iso>", methods=["GET"])
-def api_get_attendance(day_iso):
-    user, err = require_user_from_request()
-    if err:
-        return err
-    rec = get_attendance_record(user["_id"], day_iso)
-    return jsonify(rec or {}), 200
-
-@app.route("/attendance/<day_iso>", methods=["DELETE"])
-def api_delete_attendance(day_iso):
-    user, err = require_user_from_request()
-    if err:
-        return err
-    delete_attendance_record(user["_id"], day_iso)
-    return jsonify({"ok": True})
-
-@app.route("/attendance", methods=["POST"])
-def api_save_attendance():
-    user, err = require_user_from_request()
-    if err:
-        return err
+# ---------------------------
+# Forgot password (create reset token) + reset view
+# ---------------------------
+@app.route("/api/forgot", methods=["POST"])
+def api_forgot():
     payload = request.get_json(force=True)
-    day = payload.get("date")
-    if not day:
-        return jsonify({"error": "missing_date"}), 400
-    shift = payload.get("shift")
-    status = payload.get("status")
-    try:
-        ot = float(payload.get("ot_hours") or 0)
-    except:
-        ot = 0.0
-    ok = upsert_attendance(user["_id"], day, shift, status, ot)
-    if not ok:
-        return jsonify({"error": "save_failed"}), 500
-    return jsonify({"ok": True})
-
-@app.route("/summary", methods=["GET"])
-def api_summary():
-    user, err = require_user_from_request()
-    if err:
-        return err
-    today_dt = date.today()
-    year = request.args.get("year", today_dt.year, type=int)
-    month = request.args.get("month", today_dt.month, type=int)
-    if month == 1:
-        prev_month, prev_year = 12, year - 1
-    else:
-        prev_month, prev_year = month - 1, year
-    start_date = date(prev_year, prev_month, 26)
-    end_date = date(year, month, 25)
-    s = summary_for_user_in_range(user["_id"], start_date.isoformat(), end_date.isoformat())
-    s["shift_line_html"] = make_shift_line_html(s.get("shift_dates", {}))
-    return jsonify(s)
-
-# ---------- Pages ----------
-@app.route("/login")
-def page_login():
-    token = request.cookies.get(SESSION_COOKIE_NAME)
-    if token and get_user_by_session_token(token):
-        return redirect("/")
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/")
-def page_index():
-    token = request.cookies.get(SESSION_COOKIE_NAME)
-    user = get_user_by_session_token(token) if token else None
+    user = (payload.get("user") or "").strip()
     if not user:
-        return redirect("/login")
+        return jsonify({"error":"Missing username"}), 400
+    data = read_data()
+    if user not in data:
+        return jsonify({"error":"User not found"}), 404
+    # create a short-lived reset token (JWT with purpose 'reset' and username)
+    reset_token = create_jwt({"sub": user, "purpose": "reset"}, exp_seconds=RESET_EXP_SECONDS)
+    # store token info optionally
+    data[user]["reset_token"] = {"token": reset_token, "exp": int(time.time()) + RESET_EXP_SECONDS}
+    write_data(data)
+    # In production: email the reset link. Here we return the link for testing.
+    reset_link = request.url_root.rstrip("/") + url_for("reset_password_page", token=reset_token)
+    return jsonify({"ok": True, "reset_link": reset_link})
+
+@app.route("/reset/<token>", methods=["GET","POST"])
+def reset_password_page(token):
+    # GET: show form; POST: set new password
+    payload = decode_jwt(token)
+    if not payload or payload.get("purpose") != "reset":
+        return "Invalid or expired reset token", 400
+    username = payload.get("sub")
+    if request.method == "GET":
+        return f"""
+        <!doctype html><html><body>
+        <h3>Reset password for {username}</h3>
+        <form method="POST">
+          <label>New password: <input name="password" type="password"/></label><br/><br/>
+          <button type="submit">Set password</button>
+        </form>
+        </body></html>
+        """
+    # POST
+    newpw = (request.form.get("password") or "").strip()
+    if not newpw:
+        return "Missing password", 400
+    data = read_data()
+    user_obj = data.get(username)
+    if not user_obj:
+        return "User not found", 404
+    # optional: check stored reset token matches token (prevents reuse if overwritten)
+    stored = user_obj.get("reset_token", {}).get("token")
+    if stored and stored != token:
+        return "Reset token mismatch", 400
+    user_obj["password"] = generate_password_hash(newpw)
+    # delete reset token
+    user_obj.pop("reset_token", None)
+    write_data(data)
+    return f"Password updated for {username}. You may now <a href='/login'>login</a>."
+
+# ---------------------------
+# Main attendance page (requires JWT auth)
+# ---------------------------
+@app.route("/")
+@require_auth
+def index(_auth_user=None, _auth_payload=None):
+    current_user = _auth_user
+    data = read_data()
+    user_obj = data.get(current_user, {"name": "", "attendance": {}})
+    attend = user_obj.get("attendance", {})
 
     today = date.today()
     year = request.args.get("year", today.year, type=int)
     month = request.args.get("month", today.month, type=int)
 
-    # compute cycle 26 prev -> 25 curr
+    # Attendance cycle: 26 prev month → 25 current
     if month == 1:
         prev_month, prev_year = 12, year - 1
     else:
@@ -636,40 +662,171 @@ def page_index():
     first_weekday = raw_days[0].weekday()
     padding = (first_weekday + 1) % 7
     days = [None] * padding + raw_days
-    weeks = [days[i:i+7] for i in range(0, len(days), 7)]
+    weeks = [days[i:i + 7] for i in range(0, len(days), 7)]
 
-    # fetch attendance for this user in range
-    attendance = get_attendance_for_user(user["_id"], start_date.isoformat(), end_date.isoformat())
-
-    # summary counts & shift line
+    # Prepare summary
     total_present = total_absent = 0
     total_ot_hours = 0.0
     shift_dates = {}
-    for iso, rec in attendance.items():
+
+    for iso, rec in attend.items():
         try:
             d = datetime.fromisoformat(iso).date()
-        except:
+        except Exception:
             continue
-        st = rec.get("status")
-        if st == "Present":
+        if not (start_date <= d <= end_date):
+            continue
+        status = rec.get("status", "")
+        if status == "Present":
             total_present += 1
             try:
-                total_ot_hours += float(rec.get("ot_hours") or 0)
+                total_ot_hours += float(rec.get("ot_hours", 0) or 0)
+            except Exception:
+                pass
+        elif status == "Absent":
+            total_absent += 1
+
+        sh = (rec.get("shift") or "").strip()
+        if status == "Present" and sh and sh != "GEN":
+            shift_dates.setdefault(sh, []).append(d.day)
+
+    shift_line = make_shift_line(shift_dates)
+    total_ot_hours = round(total_ot_hours, 1)
+
+    return render_template_string(MAIN_HTML, year=year, month=month, weeks=weeks,
+        attendance=attend, calendar=calendar, today=today,
+        total_present=total_present, total_absent=total_absent,
+        total_ot_hours=total_ot_hours, shift_line=shift_line,
+        current_name=user_obj.get("name",""), is_admin=user_obj.get("is_admin", False))
+
+# ---------------------------
+# API endpoints for attendance (per-user)
+# ---------------------------
+@app.route("/attendance/<day_iso>")
+@require_auth
+def get_attendance(day_iso, _auth_user=None, _auth_payload=None):
+    user = _auth_user
+    data = read_data()
+    rec = data.get(user, {}).get("attendance", {}).get(day_iso, {})
+    return jsonify(rec)
+
+@app.route("/attendance/<day_iso>", methods=["DELETE"])
+@require_auth
+def delete_attendance(day_iso, _auth_user=None, _auth_payload=None):
+    user = _auth_user
+    data = read_data()
+    user_obj = data.get(user)
+    if not user_obj:
+        return jsonify({"error":"Not found"}), 404
+    daymap = user_obj.setdefault("attendance", {})
+    if day_iso in daymap:
+        del daymap[day_iso]
+        write_data(data)
+        return jsonify({"ok": True})
+    return jsonify({"error":"Not found"}), 404
+
+@app.route("/attendance", methods=["POST"])
+@require_auth
+def save_attendance(_auth_user=None, _auth_payload=None):
+    user = _auth_user
+    rec = request.get_json(force=True)
+    day = rec.get("date")
+    if not day:
+        return jsonify({"error":"Missing date"}), 400
+    data = read_data()
+    user_obj = data.setdefault(user, {"name": request.args.get("name",""), "password": generate_password_hash("temp"), "is_admin": False, "attendance": {}})
+    user_obj.setdefault("attendance", {})
+    try:
+        ot = float(rec.get("ot_hours", 0) or 0)
+    except:
+        ot = 0.0
+    user_obj["attendance"][day] = {"shift": rec.get("shift"), "status": rec.get("status"), "ot_hours": ot}
+    write_data(data)
+    return jsonify({"ok": True})
+
+@app.route("/summary")
+@require_auth
+def summary(_auth_user=None, _auth_payload=None):
+    user = _auth_user
+    data = read_data()
+    user_obj = data.get(user, {})
+    records = user_obj.get("attendance", {})
+    present = absent = 0
+    ot_hours = 0.0
+    shift_dates = {}
+    for day, rec in records.items():
+        st = rec.get("status")
+        if st == "Present":
+            present += 1
+            try:
+                ot_hours += float(rec.get("ot_hours") or 0)
             except:
                 pass
         elif st == "Absent":
-            total_absent += 1
+            absent += 1
         sh = (rec.get("shift") or "").strip()
         if st == "Present" and sh and sh != "GEN":
-            shift_dates.setdefault(sh, []).append(d.day)
+            try:
+                d = datetime.fromisoformat(day).day
+                shift_dates.setdefault(sh, []).append(d)
+            except:
+                pass
+    shift_line = make_shift_line(shift_dates)
+    return jsonify({"present": present, "absent": absent, "ot_hours": round(ot_hours, 1), "shift_line": shift_line})
 
-    shift_line = make_shift_line_html(shift_dates)
-    total_ot_hours = round(total_ot_hours, 1)
+# ---------------------------
+# Admin dashboard & APIs
+# ---------------------------
+@app.route("/admin")
+@require_admin
+def admin_page(_auth_user=None, _auth_payload=None):
+    data = read_data()
+    name = data.get(_auth_user, {}).get("name", "")
+    return render_template_string(ADMIN_HTML, current_name=name)
 
-    return render_template_string(MAIN_HTML,
-                                  user_name=user["name"],
-                                  year=year, month=month, weeks=weeks,
-                                  attendance=attendance, calendar=__import__("calendar"),
-                                  today=today,
-                                  total_present=total_present, total_absent=total_absent,
-                                  total_ot_hours=total_ot_hours, shift_line=shift_line)
+@app.route("/api/admin/users")
+@require_admin
+def api_admin_users(_auth_user=None, _auth_payload=None):
+    data = read_data()
+    users = []
+    for uname, obj in data.items():
+        users.append({"username": uname, "name": obj.get("name"), "is_admin": bool(obj.get("is_admin", False))})
+    return jsonify({"users": users})
+
+@app.route("/api/admin/user/<username>")
+@require_admin
+def api_admin_user(username, _auth_user=None, _auth_payload=None):
+    data = read_data()
+    obj = data.get(username)
+    if not obj:
+        return jsonify({"error":"Not found"}), 404
+    # don't return password hash
+    out = {k:v for k,v in obj.items() if k != "password"}
+    return jsonify(out)
+
+@app.route("/api/admin/user/<username>", methods=["DELETE"])
+@require_admin
+def api_admin_delete(username, _auth_user=None, _auth_payload=None):
+    data = read_data()
+    if username in data:
+        del data[username]
+        write_data(data)
+        return jsonify({"ok": True})
+    return jsonify({"error":"Not found"}), 404
+
+# ---------------------------
+# Run
+# ---------------------------
+if __name__ == "__main__":
+    # convenience: create an initial admin if none exists
+    d = read_data()
+    if "admin" not in d:
+        d["admin"] = {
+            "name": "Administrator",
+            "password": generate_password_hash("admin123"),
+            "is_admin": True,
+            "attendance": {}
+        }
+        write_data(d)
+        print("Created default admin / admin123 (change password immediately)")
+    app.run(debug=True)
